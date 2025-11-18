@@ -17,8 +17,8 @@ import requests
 from bs4 import BeautifulSoup
 
 # 账户信息：用户名和密码
-USERNAME = os.getenv('EUSERV_USERNAME') # 填写用户名或邮箱
-PASSWORD = os.getenv('EUSERV_PASSWORD') # 填写密码
+USERNAME = os.getenv('EUSERV_USERNAME')
+PASSWORD = os.getenv('EUSERV_PASSWORD')
 
 # TrueCaptcha API 配置
 TRUECAPTCHA_USERID = os.getenv('TRUECAPTCHA_USERID')
