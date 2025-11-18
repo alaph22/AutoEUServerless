@@ -454,7 +454,6 @@ def main_handler(event, context):
 
 if __name__ == "__main__":
     main_handler(None, None)
-```# filepath: c:\Users\bing\euserv_alive
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
