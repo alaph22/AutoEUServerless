@@ -15,10 +15,11 @@ import time
 import base64
 import requests
 from bs4 import BeautifulSoup
+from typing import Tuple
 
 # 账户信息：用户名和密码
-USERNAME = os.getenv('EUSERV_USERNAME')
-PASSWORD = os.getenv('EUSERV_PASSWORD')
+USERNAME = os.getenv('EUSERV_USERNAME')  # 填写用户名或邮箱
+PASSWORD = os.getenv('EUSERV_PASSWORD')  # 填写密码
 
 # TrueCaptcha API 配置
 TRUECAPTCHA_USERID = os.getenv('TRUECAPTCHA_USERID')
@@ -143,8 +144,14 @@ def handle_captcha_solved_result(solved: dict) -> str:
         solved_text = solved["result"]
         if "RESULT  IS" in solved_text:
             log("[Captcha Solver] 使用的是演示 apikey。")
-            # 因为使用了演示 apikey
-            text = re.findall(r"RESULT  IS . (.*) .", solved_text)[0]
+            # 更稳健地匹配 "RESULT IS"（忽略空白差异）
+            if re.search(r"RESULT\s+IS", solved_text, flags=re.IGNORECASE):
+                log("[Captcha Solver] 使用的是演示 apikey。")
+                m = re.search(r"RESULT\s+IS\s*[:\-]?\s*(.+)", solved_text, flags=re.IGNORECASE)
+                if m:
+                    text = m.group(1).strip()
+                else:
+                    raise KeyError("无法从识别文本中提取结果")
         else:
             # 使用自己的 apikey
             log("[Captcha Solver] 使用的是您自己的 apikey。")
@@ -202,7 +209,7 @@ def get_pin_from_mailparser(url_id: str) -> str:
 
 # 登录函数
 @login_retry(max_retry=LOGIN_MAX_RETRY_COUNT)
-def login(username: str, password: str) -> (str, requests.session):
+def login(username: str, password: str) -> Tuple[str, requests.Session]:
     # 登录 EUserv 并获取 session# 
     headers = {"user-agent": user_agent, "origin": "https://www.euserv.com"}
     url = "https://support.euserv.com/index.iphp"
