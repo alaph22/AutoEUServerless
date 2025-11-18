@@ -204,7 +204,19 @@ def get_pin_from_mailparser(url_id: str) -> str:
     response = requests.get(
         f"{MAILPARSER_DOWNLOAD_BASE_URL}{url_id}",
     )
-    pin = response.json()[0]["pin"]
+    
+    # --- 修正后的提取逻辑：适应 "mail_extract_pin" 结构 ---
+    # 1. 获取 mail_extract_pin 列表
+    mail_pin_list = response.json()[0]["mail_extract_pin"] 
+    
+    # 2. 遍历列表，提取第一个非空字符串（即 PIN 码），比硬编码索引更安全
+    try:
+        pin = next(item for item in mail_pin_list if item)
+    except StopIteration:
+        # 如果列表中没有非空字符串，则抛出错误
+        raise ValueError("无法从 mail_extract_pin 列表中提取到 PIN 码。请检查您的 Mailparser 模板配置。")
+    # --- 修正后的提取逻辑结束 ---
+    
     return pin
 
 # 登录函数
@@ -335,7 +347,12 @@ def renew(
 
     # 等待邮件解析器解析出 PIN
     time.sleep(WAITING_TIME_OF_PIN)
-    pin = get_pin_from_mailparser(mailparser_dl_url_id)
+    try:
+        pin = get_pin_from_mailparser(mailparser_dl_url_id)
+    except (KeyError, ValueError) as e:
+        log(f"[MailParser] 提取 PIN 码失败: {e}")
+        return False
+        
     log(f"[MailParser] PIN: {pin}")
 
     # 使用 PIN 获取 token
