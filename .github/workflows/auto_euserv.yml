@@ -24,6 +24,7 @@ jobs:
 
     - name: Run script
       env:
+        EUSERV_VERIFY_SSL: "false"
         EUSERV_USERNAME: ${{ secrets.EUSERV_USERNAME }}
         EUSERV_PASSWORD: ${{ secrets.EUSERV_PASSWORD }}
         TRUECAPTCHA_USERID: ${{ secrets.TRUECAPTCHA_USERID }}
