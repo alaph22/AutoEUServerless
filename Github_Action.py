@@ -13,6 +13,7 @@ import re
 import json
 import time
 import base64
+import urllib3
 import requests
 from bs4 import BeautifulSoup
 from typing import Tuple
@@ -36,7 +37,15 @@ TG_API_HOST = "https://api.telegram.org"
 
 # 代理设置（如果需要）
 PROXIES = {"http": "http://127.0.0.1:10808", "https": "http://127.0.0.1:10808"}
+# 是否验证 EUserv SSL 证书
+# 设置 EUSERV_VERIFY_SSL=false 时跳过证书验证
+VERIFY_EUSERV_SSL = os.getenv(
+    "EUSERV_VERIFY_SSL",
+    "true"
+).lower() not in ("0", "false", "no", "off")
 
+if not VERIFY_EUSERV_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # 最大登录重试次数
 LOGIN_MAX_RETRY_COUNT = 5
 
@@ -227,7 +236,8 @@ def login(username: str, password: str) -> Tuple[str, requests.Session]:
     url = "https://support.euserv.com/index.iphp"
     captcha_image_url = "https://support.euserv.com/securimage_show.php"
     session = requests.Session()
-
+    session.verify = VERIFY_EUSERV_SSL
+    
     sess = session.get(url, headers=headers)
     sess_id = re.findall("PHPSESSID=(\\w{10,100});", str(sess.headers))[0]
     session.get("https://support.euserv.com/pic/logo_small.png", headers=headers)
