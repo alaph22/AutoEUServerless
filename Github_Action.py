@@ -13,10 +13,15 @@ import re
 import json
 import time
 import base64
+import traceback
 import urllib3
 import requests
 from bs4 import BeautifulSoup
 from typing import Tuple
+
+# 单次 HTTP 请求超时（秒）。原来所有请求都不设超时，一旦对方挂起，
+# 整个 Action 会卡住很久甚至直接崩掉；现在超时后走登录重试/明确报错。
+REQUEST_TIMEOUT = 30
 
 # 账户信息：用户名和密码
 USERNAME = os.getenv('EUSERV_USERNAME') # 填写用户名或邮箱
@@ -27,7 +32,11 @@ TRUECAPTCHA_USERID = os.getenv('TRUECAPTCHA_USERID')
 TRUECAPTCHA_APIKEY = os.getenv('TRUECAPTCHA_APIKEY')
 
 # Mailparser 配置
-MAILPARSER_DOWNLOAD_URL_ID = os.getenv('MAILPARSER_DOWNLOAD_URL_ID')
+# 注意：这里用 or "" 兜底。如果仓库 Secrets 里没配 MAILPARSER_DOWNLOAD_URL_ID，
+# 原代码会在 main_handler 里对 None 调 .strip() 直接抛 AttributeError，
+# 整个运行以退出码 1 失败且没有任何中文说明；现在会走到下面的数量校验，
+# 输出明确的“mailparser_dl_url_ids 和用户名的数量不匹配!”再退出。
+MAILPARSER_DOWNLOAD_URL_ID = os.getenv('MAILPARSER_DOWNLOAD_URL_ID') or ""
 MAILPARSER_DOWNLOAD_BASE_URL = "https://files.mailparser.io/d/"
 
 # Telegram Bot 推送配置
@@ -122,7 +131,7 @@ def captcha_solver(captcha_image_url: str, session: requests.session) -> dict:
     # TrueCaptcha API 文档: https://apitruecaptcha.org/api
     # 似乎已经无法免费试用,但是充值1刀可以识别3000个二维码,足够用一阵子了
 
-    response = session.get(captcha_image_url)
+    response = session.get(captcha_image_url, timeout=REQUEST_TIMEOUT)
     encoded_string = base64.b64encode(response.content)
     url = "https://api.apitruecaptcha.org/one/gettext"
 
@@ -133,7 +142,7 @@ def captcha_solver(captcha_image_url: str, session: requests.session) -> dict:
         "mode": "human",
         "data": str(encoded_string)[2:-1],
     }
-    r = requests.post(url=url, json=data)
+    r = requests.post(url=url, json=data, timeout=REQUEST_TIMEOUT)
     j = json.loads(r.text)
     return j
 
@@ -203,30 +212,39 @@ def get_captcha_solver_usage() -> dict:
         "username": TRUECAPTCHA_USERID,
         "apikey": TRUECAPTCHA_APIKEY,
     }
-    r = requests.get(url=url, params=params)
+    r = requests.get(url=url, params=params, timeout=REQUEST_TIMEOUT)
     j = json.loads(r.text)
     return j
 
 # 从 Mailparser 获取 PIN
 def get_pin_from_mailparser(url_id: str) -> str:
     # 从 Mailparser 获取 PIN
-    response = requests.get(
-        f"{MAILPARSER_DOWNLOAD_BASE_URL}{url_id}",
-    )
-    
-    # --- 修正后的提取逻辑：适应 "mail_extract_pin" 结构 ---
-    # 1. 获取 mail_extract_pin 列表
-    mail_pin_list = response.json()[0]["mail_extract_pin"] 
-    
-    # 2. 遍历列表，提取第一个非空字符串（即 PIN 码），比硬编码索引更安全
-    try:
-        pin = next(item for item in mail_pin_list if item)
-    except StopIteration:
-        # 如果列表中没有非空字符串，则抛出错误
-        raise ValueError("无法从 mail_extract_pin 列表中提取到 PIN 码。请检查您的 Mailparser 模板配置。")
-    # --- 修正后的提取逻辑结束 ---
-    
-    return pin
+    # 原来只取一次：邮件晚到几秒、返回空列表都会直接抛 IndexError，
+    # 整个运行以退出码 1 失败。现在轮询 3 次（每次间隔 15 秒），
+    # 每次都校验返回结构，拿不到就报明确原因，而不是裸 traceback。
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                f"{MAILPARSER_DOWNLOAD_BASE_URL}{url_id}",
+                timeout=REQUEST_TIMEOUT,
+            )
+            data = response.json()
+            if not isinstance(data, list) or not data:
+                raise ValueError("Mailparser 返回为空，请确认 PIN 邮件已到达且解析规则正常。")
+            mail_pin_list = data[0].get("mail_extract_pin")
+            if not mail_pin_list:
+                raise ValueError("Mailparser 返回里没有 mail_extract_pin，请检查 Mailparser 模板配置。")
+            pin = next((item for item in mail_pin_list if item), None)
+            if not pin:
+                raise ValueError("无法从 mail_extract_pin 列表中提取到 PIN 码。请检查您的 Mailparser 模板配置。")
+            return pin
+        except (ValueError, KeyError, IndexError, TypeError, requests.exceptions.RequestException) as e:
+            last_error = e
+            log(f"[MailParser] 第 {attempt + 1} 次取 PIN 失败: {e}，15 秒后重试")
+            if attempt < 2:
+                time.sleep(15)
+    raise ValueError(f"3 次取 PIN 均失败，最后一次原因: {last_error}")
 
 # 登录函数
 @login_retry(max_retry=LOGIN_MAX_RETRY_COUNT)
@@ -237,21 +255,42 @@ def login(username: str, password: str) -> Tuple[str, requests.Session]:
     captcha_image_url = "https://support.euserv.com/securimage_show.php"
     session = requests.Session()
     session.verify = VERIFY_EUSERV_SSL
-    
-    sess = session.get(url, headers=headers)
-    sess_id = re.findall("PHPSESSID=(\\w{10,100});", str(sess.headers))[0]
-    session.get("https://support.euserv.com/pic/logo_small.png", headers=headers)
+    try:
+        sess = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        # 取 sess_id：原来只从响应头里用正则取，取不到就 [0] 直接抛 IndexError，
+        # 整个运行以退出码 1 失败。现在依次试三处：响应头、Cookie、302 跳转地址
+        # 里的 ?sess_id=（实测跳转地址里一定带有 sess_id），都拿不到才返回登录失败，
+        # 让外面的重试装饰器再试，而不是崩掉。
+        sess_id = ""
+        found = re.findall("PHPSESSID=(\\w{10,100});", str(sess.headers))
+        if found:
+            sess_id = found[0]
+        elif session.cookies.get("PHPSESSID"):
+            sess_id = session.cookies.get("PHPSESSID")
+        else:
+            m = re.search(r"[?&]sess_id=([0-9a-f]{10,100})", sess.url)
+            if m:
+                sess_id = m.group(1)
+        if not sess_id:
+            log("[AutoEUServerless] 未能从 EUserv 响应里拿到 sess_id，返回登录失败重试")
+            return "-1", session
+        session.get("https://support.euserv.com/pic/logo_small.png", headers=headers, timeout=REQUEST_TIMEOUT)
 
-    login_data = {
-        "email": username,
-        "password": password,
-        "form_selected_language": "en",
-        "Submit": "Login",
-        "subaction": "login",
-        "sess_id": sess_id,
-    }
-    f = session.post(url, headers=headers, data=login_data)
-    f.raise_for_status()
+        login_data = {
+            "email": username,
+            "password": password,
+            "form_selected_language": "en",
+            "Submit": "Login",
+            "subaction": "login",
+            "sess_id": sess_id,
+        }
+        f = session.post(url, headers=headers, data=login_data, timeout=REQUEST_TIMEOUT)
+        f.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        # 网络异常（超时、证书、连接被重置等）原来会直接抛到顶层导致整个运行崩掉；
+        # 现在记一条中文日志并返回登录失败，让重试装饰器再试几次。
+        log(f"[AutoEUServerless] 登录请求异常: {type(e).__name__}: {e}，返回登录失败重试")
+        return "-1", session
 
     if "Hello" not in f.text and "Confirm or change your customer data here" not in f.text:
         if "To finish the login process please solve the following captcha." not in f.text:
@@ -269,24 +308,40 @@ def login(username: str, password: str) -> Tuple[str, requests.Session]:
                 # 捕获未找到解析结果的错误
                 log("[AutoEUServerless] 验证码识别结果结构异常，无法解析。")
                 return "-1", session
+            except requests.exceptions.RequestException as e:
+                log(f"[AutoEUServerless] 验证码识别请求异常: {type(e).__name__}: {e}")
+                return "-1", session
 
             log("[Captcha Solver] 识别的验证码是: {}".format(captcha_code))
 
             if CHECK_CAPTCHA_SOLVER_USAGE:
-                usage = get_captcha_solver_usage()
-                log("[Captcha Solver] 当前日期 {0} API 使用次数: {1}".format(
-                    usage[0]["date"], usage[0]["count"]
-                ))
+                try:
+                    usage = get_captcha_solver_usage()
+                    if usage:
+                        log("[Captcha Solver] 当前日期 {0} API 使用次数: {1}".format(
+                            usage[0]["date"], usage[0]["count"]
+                        ))
+                    else:
+                        log("[Captcha Solver] 未能获取 API 使用次数")
+                except Exception as e:
+                    # 使用次数查不到不该导致登录失败，只记一条日志
+                    log(f"[Captcha Solver] 获取 API 使用次数失败: {e}")
 
-            f2 = session.post(
-                url,
-                headers=headers,
-                data={
-                    "subaction": "login",
-                    "sess_id": sess_id,
-                    "captcha_code": captcha_code,
-                },
-            )
+            try:
+                f2 = session.post(
+                    url,
+                    headers=headers,
+                    data={
+                        "subaction": "login",
+                        "sess_id": sess_id,
+                        "captcha_code": captcha_code,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                f2.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                log(f"[AutoEUServerless] 提交验证码请求异常: {type(e).__name__}: {e}")
+                return "-1", session
             if "To finish the login process please solve the following captcha." not in f2.text:
                 log("[Captcha Solver] 验证通过")
                 return sess_id, session
@@ -302,7 +357,7 @@ def get_servers(sess_id: str, session: requests.session) -> {}:
     d = {}
     url = "https://support.euserv.com/index.iphp?sess_id=" + sess_id
     headers = {"user-agent": user_agent, "origin": "https://www.euserv.com"}
-    f = session.get(url=url, headers=headers)
+    f = session.get(url=url, headers=headers, timeout=REQUEST_TIMEOUT)
     f.raise_for_status()
     soup = BeautifulSoup(f.text, "html.parser")
     for tr in soup.select(
@@ -341,28 +396,33 @@ def renew(
         "subaction": "choose_order",
         "choose_order_subaction": "show_contract_details",
     }
-    session.post(url, headers=headers, data=data)
+    try:
+        session.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
 
-    # 弹出 'Security Check' 窗口，将自动触发 '发送 PIN'。
-    session.post(
-        url,
-        headers=headers,
-        data={
-            "sess_id": sess_id,
-            "subaction": "show_kc2_security_password_dialog",
-            "prefix": "kc2_customer_contract_details_extend_contract_",
-            "type": "1",
-        },
-    )
+        # 弹出 'Security Check' 窗口，将自动触发 '发送 PIN'。
+        session.post(
+            url,
+            headers=headers,
+            data={
+                "sess_id": sess_id,
+                "subaction": "show_kc2_security_password_dialog",
+                "prefix": "kc2_customer_contract_details_extend_contract_",
+                "type": "1",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        log(f"[AutoEUServerless] 续期请求异常: {type(e).__name__}: {e}")
+        return False
 
     # 等待邮件解析器解析出 PIN
     time.sleep(WAITING_TIME_OF_PIN)
     try:
         pin = get_pin_from_mailparser(mailparser_dl_url_id)
-    except (KeyError, ValueError) as e:
+    except (KeyError, ValueError, IndexError, TypeError, requests.exceptions.RequestException) as e:
         log(f"[MailParser] 提取 PIN 码失败: {e}")
         return False
-        
+
     log(f"[MailParser] PIN: {pin}")
 
     # 使用 PIN 获取 token
@@ -374,18 +434,37 @@ def renew(
         "type": 1,
         "ident": f"kc2_customer_contract_details_extend_contract_{order_id}",
     }
-    f = session.post(url, headers=headers, data=data)
-    f.raise_for_status()
-    if not json.loads(f.text)["rs"] == "success":
+    try:
+        f = session.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
+        f.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        log(f"[AutoEUServerless] 获取续期 token 请求异常: {type(e).__name__}: {e}")
         return False
-    token = json.loads(f.text)["token"]["value"]
+    try:
+        result = json.loads(f.text)
+    except ValueError:
+        # EUserv 没返回 JSON（例如返回了报错页面）原来会直接抛 JSONDecodeError
+        # 导致整个运行崩掉；现在记下返回内容前 200 字并按续期失败处理。
+        log(f"[AutoEUServerless] 获取 token 返回的不是 JSON: {f.text[:200]}")
+        return False
+    if not result.get("rs") == "success":
+        log(f"[AutoEUServerless] 获取 token 未成功: {f.text[:200]}")
+        return False
+    token = result.get("token", {}).get("value")
+    if not token:
+        log("[AutoEUServerless] 获取 token 成功但响应里没有 token 值")
+        return False
     data = {
         "sess_id": sess_id,
         "ord_id": order_id,
         "subaction": "kc2_customer_contract_details_extend_contract_term",
         "token": token,
     }
-    session.post(url, headers=headers, data=data)
+    try:
+        session.post(url, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        log(f"[AutoEUServerless] 提交续期请求异常: {type(e).__name__}: {e}")
+        return False
     time.sleep(5)
     return True
 
@@ -428,7 +507,7 @@ def telegram():
         "disable_web_page_preview": "true"
     }
     response = requests.post(
-        TG_API_HOST + "/bot" + TG_BOT_TOKEN + "/sendMessage", data=data
+        TG_API_HOST + "/bot" + TG_BOT_TOKEN + "/sendMessage", data=data, timeout=REQUEST_TIMEOUT
     )
     if response.status_code != 200:
         print("Telegram Bot 推送失败")
@@ -451,32 +530,62 @@ def main_handler(event, context):
     if len(mailparser_dl_url_id_list) != len(user_list):
         log("[AutoEUServerless] mailparser_dl_url_ids 和用户名的数量不匹配!")
         exit(1)
+    any_failed = False
     for i in range(len(user_list)):
         print("*" * 30)
         log("[AutoEUServerless] 正在续费第 %d 个账号" % (i + 1))
-        sessid, s = login(user_list[i], passwd_list[i])
-        if sessid == "-1":
-            log("[AutoEUServerless] 第 %d 个账号登陆失败，请检查登录信息" % (i + 1))
-            continue
-        SERVERS = get_servers(sessid, s)
-        log("[AutoEUServerless] 检测到第 {} 个账号有 {} 台 VPS，正在尝试续期".format(i + 1, len(SERVERS)))
-        for k, v in SERVERS.items():
-            if v:
-                if not renew(sessid, s, passwd_list[i], k, mailparser_dl_url_id_list[i]):
-                    log("[AutoEUServerless] ServerID: %s 续订错误!" % k)
+        try:
+            sessid, s = login(user_list[i], passwd_list[i])
+            if sessid == "-1":
+                log("[AutoEUServerless] 第 %d 个账号登陆失败，请检查登录信息" % (i + 1))
+                any_failed = True
+                continue
+            SERVERS = get_servers(sessid, s)
+            log("[AutoEUServerless] 检测到第 {} 个账号有 {} 台 VPS，正在尝试续期".format(i + 1, len(SERVERS)))
+            for k, v in SERVERS.items():
+                if v:
+                    if not renew(sessid, s, passwd_list[i], k, mailparser_dl_url_id_list[i]):
+                        log("[AutoEUServerless] ServerID: %s 续订错误!" % k)
+                        any_failed = True
+                    else:
+                        log("[AutoEUServerless] ServerID: %s 已成功续订!" % k)
                 else:
-                    log("[AutoEUServerless] ServerID: %s 已成功续订!" % k)
-            else:
-                log("[AutoEUServerless] ServerID: %s 无需更新" % k)
-        time.sleep(15)
-        check(sessid, s)
-        time.sleep(5)
+                    log("[AutoEUServerless] ServerID: %s 无需更新" % k)
+            time.sleep(15)
+            check(sessid, s)
+            time.sleep(5)
+        except Exception:
+            # 原来单个账号里任何一步抛异常都会直接结束整个脚本，
+            # 不发 Telegram、也不处理后面的账号，Action 只剩一个退出码 1。
+            # 现在把异常记下来（含 traceback，方便从日志里定位），
+            # 继续处理下一个账号，最后统一发 Telegram 并以退出码 1 结束，
+            # 让这次运行在 Actions 里显示为失败，而不是悄悄“成功”。
+            any_failed = True
+            log("[AutoEUServerless] 第 %d 个账号处理异常:\n%s" % (i + 1, traceback.format_exc()))
 
-    # 发送 Telegram 通知
+    # 发送 Telegram 通知：无论成功失败都尽量发，推送本身失败也不再让脚本崩掉。
     if TG_BOT_TOKEN and TG_USER_ID and TG_API_HOST:
-        telegram()
+        try:
+            telegram()
+        except Exception as e:
+            print(f"Telegram Bot 推送异常: {e}")
 
     print("*" * 30)
+    if any_failed:
+        log("[AutoEUServerless] 本次运行有账号未完成续期，请查看日志和 Telegram 通知")
+        exit(1)
 
 if __name__ == "__main__":
-    main_handler(None, None)
+    try:
+        main_handler(None, None)
+    except SystemExit:
+        raise
+    except Exception:
+        # 最后一道防线：主流程之外抛出的异常也记下来并尝试推送，避免只剩退出码 1。
+        log("[AutoEUServerless] 主流程异常:\n%s" % traceback.format_exc())
+        if TG_BOT_TOKEN and TG_USER_ID and TG_API_HOST:
+            try:
+                telegram()
+            except Exception:
+                pass
+        exit(1)
