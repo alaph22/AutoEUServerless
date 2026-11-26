@@ -2,17 +2,15 @@ name: Auto EUserv
 
 on:
   schedule:
-    # 每周日 UTC 03:00 运行（北京时间 11:00）。
-    # 原来是每月 13 号才跑一次，失败一次就要再等一个月，容易错过续期窗口。
-    # 脚本自己会判断每台 VPS 是否到了可续期时间，不到就只报“无需更新”，
-    # 所以每周跑不会重复续期，一次失败下周日还能再试。
-    - cron: '0 3 * * 0'
+    # 每月 13 号 UTC 03:00 运行（北京时间 11:00），每月只跑一次，节省 TrueCaptcha 验证码次数。
+    # 脚本自己会判断每台 VPS 是否到了可续期时间，不到就只报“无需更新”，不会重复续期。
+    - cron: '0 3 13 * *'
   workflow_dispatch:
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
-  
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@main
